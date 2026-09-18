@@ -38,9 +38,10 @@ enum dbg_phase {
   PHASE_PUBLISH        = 12,  /* byte-swap and push to the ring  (yields) */
   PHASE_VSYNC_CFG      = 13,  /* restoring VSYNC config          BLOCKING */
   PHASE_RECOVER        = 14,  /* escape hatch re-initialising    BLOCKING */
+  PHASE_CS_RESYNC      = 15,  /* /CS held high for VoSPI resync  (yields) */
 };
 
-#define DBG_PHASE_COUNT (16u)   /* array size; 13 phases in use */
+#define DBG_PHASE_COUNT (16u)   /* array size; all 16 in use */
 
 struct dbg_counters {
   /* --- original nine, offsets unchanged --- */
@@ -82,6 +83,16 @@ struct dbg_counters {
   uint32_t vsync_cfg_fails;  /* +0xC4  lepton_restore_vsync_config() errors */
   uint32_t hard_recoveries;  /* +0xC8  escape hatch fired this many times */
   uint32_t worst_desync_run; /* +0xCC  longest run of consecutive rejects seen */
+
+  /* --- /CS VoSPI resync, added with the /CS-toggling escape hatch --- */
+  uint32_t cs_resyncs;            /* +0xD0  /CS-high resyncs performed */
+  uint32_t wedge_recoveries;      /* +0xD4  frame validated after >= 1 escape-hatch
+                                             firing, within the same stream */
+  uint32_t last_recovery_firings; /* +0xD8  firings the latest recovery needed:
+                                             1..3 = /CS resync alone did it,
+                                             4 = right after a /CS + CCI power cycle */
+  uint32_t cs_busy_waits;         /* +0xDC  lepton_cs_release() found a transfer
+                                             in flight (should stay 0) */
 };
 
 extern volatile struct dbg_counters g_dbg;

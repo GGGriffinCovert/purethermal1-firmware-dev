@@ -107,9 +107,12 @@ Static locals are not in `main.map` (local symbols); use
 
 `scripts/analyze_vospi_dump.py` decodes a raw dump of `lepton_buffers[]`
 (4 × 15384 = `0xF060` bytes from the `lepton_buffers` address in `main.map`)
-and reports whether the VoSPI packet headers sit at byte 0 of each 244-byte
-record, at some other halfword offset, or at a bit offset. `--selftest` checks
-it against synthetic buffers.
+and reports what the sensor sent (video, discards only, or nothing
+VoSPI-like) and where the packet boundaries fall relative to the MCU's
+244-byte records (aligned, a halfword offset, or a bit offset). `--selftest`
+checks it against synthetic buffers, including real-looking discards. The
+first version reported spurious BIT SLIPs on discard-only buffers (the
+discard payload counter fakes short runs); fixed 2026-09-18.
 
 ### SWD register map for the SPI path
 
@@ -159,14 +162,50 @@ On a wedged unit `last_end_line` reads **0xFF** with `g_telemetry_num_lines`
 20 of the *same buffer*, is a valid 1. An earlier build measured
 `first_line_bad` climbing past 1800 on a wedged unit with `resync_giveups`
 static at 3. (Earlier reading: "0xFF is an idle bus, real packets at the front,
-nothing at the back." That was never checked against the buffer itself; under
-a framing offset these fields are just whatever pixel bytes sit where the
-header should be, and TTT=1 is a 1-in-8 coincidence. The buffer dump settles
-which.)
+nothing at the back." The buffer dump below shows otherwise: both values
+come from the discard ID `0x1FFF`.)
 
 **SPI2 is clean (2026-09-18).** `SPI2_SR` = `0x0002` on a wedged unit: TXE only.
 OVR, BSY, RXNE, MODF, FRE all clear. The `DMA2_LISR` = 0 read taken with it is
-the wrong controller (see the register map).
+the wrong controller (see the register map). `GPIOB_IDR` bit 12 = 0 on the same
+unit: /CS is asserted while idle, as the code predicts.
+
+Datasheet references below are to the Lepton Engineering Datasheet Rev 400
+(500-0771-01-09, in the project): VoSPI sync procedure §4.2.3.3.1 (Lepton 3.x),
+loss-of-sync rules §4.2.3.3.2, SPI Mode 3 and 20 MHz max §4.2.1 and Table 15.
+
+**The sensor is sending nothing but discard packets (buffer dump,
+2026-09-18).** All four `lepton_buffers` hold 60/60 discard packets: ID
+`0x1FFF`, CRC `0xFFFF`, zero payload except a small status block at words
+14–19 (word 17 is a counter whose top nibble steps each packet). No video
+packet anywhere. Per the datasheet the sensor sends discards "from the
+beginning of SPI video transmission until synchronization is achieved".
+This re-reads two earlier observations: `last_end_line` = 0xFF and "segment
+1 at line 20" are both the discard ID `0x1FFF` (low byte FF, TTT bits 001).
+There never were "real packets at the front".
+
+**The discards' framing moves between reads.** Buffers 0 and 3: discard IDs
+at byte 0 of every record (aligned). Buffers 1 and 2: 1505 bits in (94
+halfwords + 1 bit), an odd bit count the MCU cannot produce with 16-bit
+frames. In buffer 1, line 59 (left over from an older read) is aligned while
+lines 0–58 (the resync's 59-line read) are offset. In the offset buffers the
+word at record offset 0 is payload `0x0000`, which passes the resync's
+"packet 0" test, so the resync walk exits at once on a false packet 0
+(defect 6, now observed).
+
+**MCU SPI/DMA state is exactly the expected idle state** (same unit, core
+halted): `DMA1_LISR` `0x04000000` (HTIF3 only), `DMA1_HISR` `0x10` (HTIF4
+only), S3CR `0x00032C00`, S4CR `0x00032C40`, both NDTR 0, both PAR
+`0x4000380C`, both M0AR `0x20002100` = `lepton_buffers[0]` = `current_buffer`,
+both FCR `0x20`; SPI2 CR1 `0x947`, CR2 `0x4`, SR `0x2`. The last transfer
+completed and its TC interrupt was serviced.
+
+**Resuming with /CS still low did not recover it.** The core was found halted
+when CubeProgrammer connected (cause not yet known: a firmware hang cannot
+debug-halt a Cortex-M; a halt request, breakpoint or fault vector catch can.
+`DFSR` at `0xE000ED30` says which). Run for ~10 s: LED stayed frozen, ffmpeg
+got nothing. That is the sham control failing, *provided* the core was in
+thread mode and not a fault handler; check PC/xPSR.
 
 **The LED** is toggled only in `lepton_task`: 1 Hz in the idle blink loop,
 once per *validated* frame while streaming. Frozen means neither — the task is
@@ -287,6 +326,10 @@ Do not re-litigate these; each died to a measurement.
   and the MCU as master generating every clock, the MCU's side cannot be
   byte-shifted.
 
+- **Stuck MCU DMA/SPI state** (stream left enabled, NDTR/M0AR not reloaded,
+  TX/RX pointer mismatch, latched error flags) — the halted-core snapshot on a
+  wedged unit matches the healthy idle values register for register.
+
 One methodological note: `ISER1` bit 8 clear is **not** evidence the task failed
 to re-enable EXTI. The EXTI callback disables its own IRQ, so that is the normal
 state for most of `lepton_task`'s loop body.
@@ -295,37 +338,38 @@ state for most of `lepton_task`'s loop body.
 
 ## Current leading hypothesis (unverified)
 
-**The sensor's VoSPI packet framing no longer matches the MCU's 244-byte
-records, and the firmware has no way to re-establish it.**
+**The sensor is stuck in its unsynchronized state, sending only discard
+packets, and nothing the firmware does after boot can take it out of that
+state.** (Revised 2026-09-18 after the buffer dump. The earlier framing-offset
+idea turned out to be a symptom: the sensor's packet phase does wander, by odd
+bit counts, but even when aligned it sends no video.)
 
 The datasheet lists three ways to lose VoSPI sync: a packet not clocked out
 within 3 line periods, a segment not fully read before the next arrives, and
 any segment (unique or invalid frame) left unread. **Every single-frame grab
 almost certainly breaks the third rule**: at STREAMOFF the MCU stops reading
 while the sensor keeps producing segments until the LPM2 command lands.
-Whether LPM2 / CCI power-on resets VoSPI state is not documented. If it
-doesn't, every restart begins with the sensor out of sync and depends on the
-firmware's recovery. That recovery idles SCK for 185 ms with /CS still low, which is not
-the documented procedure. Usually the sensor comes back anyway (that is the
+Whether LPM2 / CCI power-on resets VoSPI state is not documented. The only
+documented way back to sync is /CS high with SCK idle for > 185 ms, and this
+firmware never raises /CS. Usually the sensor comes back anyway (that is the
 "one `first_line_bad` per grab" floor). The hypothesis is that occasionally it
-comes back with its packet boundaries at a different point in the byte stream
-than the MCU's, and from then on:
+doesn't, and from then on:
 
-- every read is rejected, 100%, because the "header" the firmware checks is
-  pixel data;
-- the resync walk still "finds packet 0", because dark pixel data passes its
-  one-halfword test (defect 6), which is why `resync_giveups` stays flat;
-- USB re-enumeration, sensor CCI power cycles and the escape hatch change
-  nothing, since none of them touch /CS or `RESET_L`;
+- every read is rejected, 100%, because every packet is a discard;
+- the resync walk either gives up on discards (aligned phase) or exits on a
+  false "packet 0" read from the zero payload (offset phase, defect 6);
+- USB re-enumeration, sensor CCI power cycles, the escape hatch and a long
+  SCK idle with /CS low (the sham, observed) change nothing, since none of
+  them raise /CS or pulse `RESET_L`;
 - an MCU reset fixes it, since it hard-resets the sensor and releases the SPI
-  pins.
+  pins;
 - Mode B never loses sync, so it never wedges.
 
-Not yet explained: the sensor re-insert result (see the caveat above), and the
-exact event that creates the offset. Candidates: the sensor's VoSPI restarting
-while a premature read is in flight (defect 4 makes a read start the instant
-EXTI is enabled after `lepton_power_on()`), or a missed SCK edge at 24 MHz
-(defect 3).
+Not yet explained: the sensor re-insert result (see the caveat above), and why
+the discards' phase moves between reads by an odd number of bits. The MCU
+only ever clocks whole 16-bit frames and its DMA state is clean, so the
+sensor is either miscounting SCK edges (24 MHz vs 20 MHz max, defect 3) or
+restarting its packet counter mid-transfer.
 
 ### Tests, on the currently hung unit, in this order
 
@@ -339,23 +383,37 @@ Steps 1–2 are non-destructive. Steps 3–4 may clear the wedge, so they go las
    Read, Save As .bin) and `current_buffer` (4 bytes, address from
    `arm-none-eabi-nm main.out | grep current_buffer`). Run
    `python3 scripts/analyze_vospi_dump.py lepton_buffers.bin`.
+   Map-free cross-check of the base address: `DMA1_S3M0AR` (`0x40026064`)
+   points at one of the four buffers. The low byte of the word at
+   `M0AR + 0x3C0C` is that buffer's `number` (0–3), so
+   `lepton_buffers = M0AR − number × 0x3C18`.
 3. **Sham control:** leave the core halted ~3 s in total, then Run. This idles
    SCK for far longer than the resync's 185 ms, with /CS still low. Watch the
    LED and ffmpeg for ~10 s.
 4. **/CS test** (only if still wedged): Halt again, then
    - read `GPIOB_MODER` (`0x40020400`), call it M
-   - write `GPIOB_BSRR` (`0x40020418`) = `0x00001000` (ODR12 = 1)
+   - set ODR12: write `GPIOB_ODR` (`0x40020414`) = current ODR | `0x00001000`.
+     (Writing `GPIOB_BSRR` from CubeProgrammer reports an error: BSRR is
+     write-only and reads back 0, so the read-back check fails. Keep every
+     other ODR bit, PB5/PB7 are the sensor power enables.)
    - write `GPIOB_MODER` = `(M & ~0x03000000) | 0x01000000` → PB12 becomes a GPIO
      driving /CS high; `GPIOB_IDR` bit 12 should now read 1
    - wait ≥ 1 s
    - write `GPIOB_MODER` = M → PB12 back to NSS, /CS low with SCK idle
    - Run, watch the LED / ffmpeg / `frames_completed`.
 
+   `GPIOB_MODER` also configures BUCK_ON (PB5) and LDO_ON (PB7), the sensor's
+   power enables, and I2C1 (PB8/PB9). Change only bits 25:24: with PB12–15 all
+   on SPI2 the top byte is `AA`, and the edited value differs only in that
+   byte (`AA` → `A9`).
+
    If the host re-enumerates during the halt, do one fresh grab afterwards
    before judging.
 
 | dump says | sham | /CS test | conclusion |
 |---|---|---|---|
+| **DISCARDS ONLY (observed)** | **no (observed)** | recovers | **confirmed**: the sensor is stuck unsynchronized and only the datasheet resync gets it out |
+| DISCARDS ONLY | no | no | sensor stuck deeper (VoSPI or pipeline); try a `RESET_L` pulse next |
 | FRAMING OFFSET or BIT SLIP | no | recovers | **confirmed**: fix = datasheet resync (below) |
 | FRAMING OFFSET or BIT SLIP | recovers | — | sensor times out on SCK idle alone, but only after > 185 ms: lengthen the idle *and* add /CS |
 | ALIGNED/PARTIAL | — | — | framing is fine; the problem is VSYNC-to-read timing (packet level). Look at EXTI/latency, defect 4 |

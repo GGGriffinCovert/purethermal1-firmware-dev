@@ -4,6 +4,7 @@
 #include "stm32f4xx_hal_spi.h"
 
 #include "lepton.h"
+#include "dbg_counters.h"
 
 #include "project_config.h"
 
@@ -54,6 +55,56 @@ void lepton_transfer(lepton_buffer *buf, int nlines)
   }
 
   buf->status = LEPTON_STATUS_TRANSFERRING;
+}
+
+/* /CS is PB12, configured as SPI2_NSS in hardware-output mode. On the F4 that
+ * holds /CS low for as long as SPE = 1, and SPE is set once in lepton_init()
+ * and never cleared, so without this nothing after boot ever deasserts /CS -
+ * and /CS high with SCK idle for > 185 ms is the only documented way to put
+ * the Lepton back into a state where it can establish VoSPI sync.
+ *
+ * lepton_cs_release() borrows PB12 as a GPIO output driven high. SPI2 stays
+ * enabled and configured and PB12's alternate-function selection (AF5) is
+ * untouched, so lepton_cs_restore() only has to hand the pin back, at which
+ * point /CS drops low again. GPIOB also carries the sensor's power enables
+ * (PB5, PB7) and I2C1 (PB8, PB9): only PB12's MODER bits are modified.
+ *
+ * The caller keeps SCK idle between the two calls (no lepton_transfer()). */
+#define LEPTON_CS_PIN_POS  (12u)
+#define LEPTON_CS_MODER_MASK (3u << (2u * LEPTON_CS_PIN_POS))
+
+void lepton_cs_release(void)
+{
+  uint32_t primask;
+  uint32_t t0 = HAL_GetTick();
+
+  /* Nothing should be in flight when this is called. If something is, let
+   * it finish rather than cut a packet in half; bounded so it cannot hang. */
+  if ((hspi2.hdmarx->Instance->CR & DMA_SxCR_EN) ||
+      (hspi2.hdmatx->Instance->CR & DMA_SxCR_EN) ||
+      (hspi2.Instance->SR & SPI_SR_BSY))
+  {
+    g_dbg.cs_busy_waits++;
+    while (((hspi2.hdmarx->Instance->CR & DMA_SxCR_EN) ||
+            (hspi2.Instance->SR & SPI_SR_BSY)) &&
+           (HAL_GetTick() - t0) < 5) {}
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  GPIOB->BSRR = (1u << LEPTON_CS_PIN_POS);                     /* ODR12 = 1 first */
+  GPIOB->MODER = (GPIOB->MODER & ~LEPTON_CS_MODER_MASK)
+               | (1u << (2u * LEPTON_CS_PIN_POS));             /* then output: /CS high */
+  __set_PRIMASK(primask);
+}
+
+void lepton_cs_restore(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  GPIOB->MODER = (GPIOB->MODER & ~LEPTON_CS_MODER_MASK)
+               | (2u << (2u * LEPTON_CS_PIN_POS));             /* AF5 SPI2_NSS: /CS low */
+  __set_PRIMASK(primask);
 }
 
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)

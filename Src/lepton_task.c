@@ -41,6 +41,18 @@ uint8_t lepton_i2c_buffer[36];
 #define LEPTON_RECOVER_POWER_OFF_MS    (250)
 #define LEPTON_RECOVER_SETTLE_MS       (250)
 
+// Escape-hatch tiers. Every firing does the datasheet VoSPI resync (/CS high,
+// SCK idle > 185 ms), which leaves the sensor's configuration alone. Every
+// LEPTON_CCI_REINIT_EVERY-th consecutive firing also does the old CCI power
+// cycle and reconfiguration, inside the /CS-high window. g_dbg records which
+// tier a recovery needed (last_recovery_firings).
+#define LEPTON_CCI_REINIT_EVERY        (4)
+
+// Define to also do a /CS resync on every stream start (after the CCI power-on
+// and VSYNC config). Off while the escape hatch alone is being evaluated, so
+// that any recovery can be attributed to it.
+// #define LEPTON_CS_RESYNC_ON_START
+
 #define RING_SIZE (4)
 lepton_buffer lepton_buffers[RING_SIZE];
 
@@ -156,6 +168,7 @@ PT_THREAD( lepton_task(struct pt *pt))
 	static uint8_t last_end_line = 0;
 	static int resync_tries = 0;
 	static uint32_t consecutive_desyncs = 0;
+	static uint32_t escape_firings = 0;     // since the last validated frame
 	static uint8_t has_started_a_stream = 0;
 	curtick = last_tick = HAL_GetTick();
 
@@ -219,6 +232,21 @@ PT_THREAD( lepton_task(struct pt *pt))
 			DBG_PHASE(PHASE_VSYNC_CFG);
 			if (lepton_restore_vsync_config() != HAL_OK)
 				g_dbg.vsync_cfg_fails++;
+
+#ifdef LEPTON_CS_RESYNC_ON_START
+			DBG_PHASE(PHASE_CS_RESYNC);
+			lepton_cs_release();
+			g_dbg.cs_resyncs++;
+			transferring_timer = HAL_GetTick();
+			PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_VOSPI_RESYNC_MS);
+			lepton_cs_restore();
+
+			__HAL_GPIO_EXTI_CLEAR_IT(LEPTON_GPIO3_Pin);
+			HAL_NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
+#endif
+
+			// A recovery in a new stream can't be credited to the escape hatch.
+			escape_firings = 0;
 		}
 #endif
 
@@ -284,27 +312,50 @@ PT_THREAD( lepton_task(struct pt *pt))
 			// the pipeline unable to produce a frame, a wedge that needs the
 			// user to physically unplug the camera is a far worse failure than
 			// a half-second interruption.
+			//
+			// A wedged unit's buffers hold nothing but discard packets: the
+			// sensor never re-establishes VoSPI sync, and the CCI power cycle
+			// alone was measured not to help. What it needs (datasheet Rev 400
+			// section 4.2.3.3.1) is /CS high with SCK idle for > 185 ms, which
+			// nothing else in this firmware ever does.
 			if (consecutive_desyncs >= LEPTON_MAX_CONSECUTIVE_DESYNCS)
 			{
 				g_dbg.hard_recoveries++;
-				DBG_PHASE(PHASE_RECOVER);
-				DEBUG_PRINTF("Unrecoverable desync, re-initialising sensor\r\n");
+				escape_firings++;
+				DEBUG_PRINTF("Unrecoverable desync, VoSPI resync #%lu\r\n", escape_firings);
 
 				HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
 
-				lepton_low_power();
+				// No transfer is in flight here (the last one completed and was
+				// just rejected) and none starts until /CS is restored, so SCK
+				// stays idle for the whole window.
+				DBG_PHASE(PHASE_CS_RESYNC);
+				lepton_cs_release();
+				g_dbg.cs_resyncs++;
+
+				if ((escape_firings % LEPTON_CCI_REINIT_EVERY) == 0)
+				{
+					DBG_PHASE(PHASE_RECOVER);
+					lepton_low_power();
+					transferring_timer = HAL_GetTick();
+					PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_RECOVER_POWER_OFF_MS);
+
+					lepton_power_on();
+					transferring_timer = HAL_GetTick();
+					PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_RECOVER_SETTLE_MS);
+
+					DBG_PHASE(PHASE_VSYNC_CFG);
+					if (lepton_restore_vsync_config() != HAL_OK)
+						g_dbg.vsync_cfg_fails++;
+
+					apply_format_config();
+					DBG_PHASE(PHASE_CS_RESYNC);
+				}
+
+				// The > 185 ms idle counts from here, after any CCI work.
 				transferring_timer = HAL_GetTick();
-				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_RECOVER_POWER_OFF_MS);
-
-				lepton_power_on();
-				transferring_timer = HAL_GetTick();
-				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_RECOVER_SETTLE_MS);
-
-				DBG_PHASE(PHASE_VSYNC_CFG);
-				if (lepton_restore_vsync_config() != HAL_OK)
-					g_dbg.vsync_cfg_fails++;
-
-				apply_format_config();
+				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_VOSPI_RESYNC_MS);
+				lepton_cs_restore();
 
 				while (dequeue_lepton_buffer() != NULL) {}
 
@@ -388,6 +439,12 @@ PT_THREAD( lepton_task(struct pt *pt))
 
 		// This frame validated, so whatever went wrong has cleared.
 		consecutive_desyncs = 0;
+		if (escape_firings)
+		{
+			g_dbg.wedge_recoveries++;
+			g_dbg.last_recovery_firings = escape_firings;
+			escape_firings = 0;
+		}
 
 		if (((curtick = HAL_GetTick()) - last_tick) > 3000)
 		{

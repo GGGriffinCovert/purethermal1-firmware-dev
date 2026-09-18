@@ -113,6 +113,14 @@ typedef struct _lepton_buffer {
 lepton_status complete_lepton_transfer(lepton_buffer *);
 void lepton_transfer(lepton_buffer *buf, int nlines);
 
+/* VoSPI (re)sync, datasheet Rev 400 §4.2.3.3.1: /CS high with SCK idle for
+ * more than 5 frame periods (> 185 ms). Call lepton_cs_release(), wait at
+ * least LEPTON_VOSPI_RESYNC_MS without starting a transfer, then
+ * lepton_cs_restore(). */
+#define LEPTON_VOSPI_RESYNC_MS (250)
+void lepton_cs_release(void);
+void lepton_cs_restore(void);
+
 void print_image_binary_background(void);
 void lepton_init(void );
 
