@@ -96,6 +96,13 @@ void lepton_cs_release(void)
   GPIOB->MODER = (GPIOB->MODER & ~LEPTON_CS_MODER_MASK)
                | (1u << (2u * LEPTON_CS_PIN_POS));             /* then output: /CS high */
   __set_PRIMASK(primask);
+
+  /* Prove the pin actually went high. If something outside the MCU holds /CS
+   * low, this whole recovery is a no-op and the counters say so. */
+  for (volatile int i = 0; i < 32; i++) {}
+  g_dbg.cs_idr_last = GPIOB->IDR;
+  if ((g_dbg.cs_idr_last & (1u << LEPTON_CS_PIN_POS)) == 0)
+    g_dbg.cs_stuck_low++;
 }
 
 void lepton_cs_restore(void)
@@ -105,6 +112,27 @@ void lepton_cs_restore(void)
   GPIOB->MODER = (GPIOB->MODER & ~LEPTON_CS_MODER_MASK)
                | (2u << (2u * LEPTON_CS_PIN_POS));             /* AF5 SPI2_NSS: /CS low */
   __set_PRIMASK(primask);
+}
+
+/* Hardware reset of the sensor, the same pin sequence lepton_init() uses at
+ * boot: RESET_L and PWR_DWN_L low, PWR_DWN_L high after >= 190 ms, RESET_L
+ * high after another >= 190 ms. Split into steps so lepton_task can yield
+ * between them. The sensor loses all CCI configuration; see
+ * lepton_reinit_after_reset(). */
+void lepton_hw_reset_assert(void)
+{
+  LEPTON_RESET_L_LOW;
+  LEPTON_PW_DWN_LOW;
+}
+
+void lepton_hw_pwdn_release(void)
+{
+  LEPTON_PW_DWN_HIGH;
+}
+
+void lepton_hw_reset_release(void)
+{
+  LEPTON_RESET_L_HIGH;
 }
 
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)

@@ -97,6 +97,13 @@ offsets from the base are stable; new fields are only ever appended.
 | +0xC4 | `vsync_cfg_fails` |
 | +0xC8 | `hard_recoveries` |
 | +0xCC | `worst_desync_run` |
+| +0xD0 | `cs_resyncs` (/CS-resync build) |
+| +0xD4 | `wedge_recoveries` (/CS-resync build) |
+| +0xD8 | `last_recovery_firings` (/CS-resync build) |
+| +0xDC | `cs_busy_waits` (/CS-resync build, should stay 0) |
+| +0xE0 | `cs_stuck_low` (hw-reset build: PB12 driven high but read low) |
+| +0xE4 | `cs_idr_last` (hw-reset build: GPIOB IDR after last /CS release) |
+| +0xE8 | `hw_resets` (hw-reset build) |
 
 `main_loop_ticks` distinguishes *blocked* from *waiting* — it advances at
 ~470 k/s while the scheduler runs. `phase` alone cannot, because several phases
@@ -200,12 +207,19 @@ only), S3CR `0x00032C00`, S4CR `0x00032C40`, both NDTR 0, both PAR
 both FCR `0x20`; SPI2 CR1 `0x947`, CR2 `0x4`, SR `0x2`. The last transfer
 completed and its TC interrupt was serviced.
 
-**Resuming with /CS still low did not recover it.** The core was found halted
-when CubeProgrammer connected (cause not yet known: a firmware hang cannot
-debug-halt a Cortex-M; a halt request, breakpoint or fault vector catch can.
-`DFSR` at `0xE000ED30` says which). Run for ~10 s: LED stayed frozen, ffmpeg
-got nothing. That is the sham control failing, *provided* the core was in
-thread mode and not a fault handler; check PC/xPSR.
+**Manual /CS test over SWD: inconclusive.** The core was found halted when
+CubeProgrammer connected. xPSR `0x81000000` (thread mode) and CFSR/HFSR = 0,
+so it was a debugger halt, not a fault. Resuming it did not bring frames back,
+but halting the core mid-grab disrupts the USB side as well: aborting ffmpeg
+returns the LED to the 1 Hz *idle* blink (stream closed), which says nothing
+about recovery, and sometimes a further start/abort was needed to get even
+that. The CubeProgrammer write to `GPIOB_BSRR` reports an error (write-only
+register, read-back check fails) but does take effect: ODR read `0x10A0`
+afterwards, i.e. ODR12 = 1. Open question: `GPIOB_IDR` read `0x23B0`
+(bit 12 = 0) at the same time. If `GPIOB_MODER` was still `A92A648A` then,
+PB12 was driving high and something external held /CS low. Re-check before
+trusting any /CS-based result. Decision: test /CS in firmware instead (next
+section).
 
 **The LED** is toggled only in `lepton_task`: 1 Hz in the idle blink loop,
 once per *validated* frame while streaming. Frozen means neither — the task is
@@ -257,6 +271,79 @@ Slow grabs of 1–2 s are FFC events on the sensor's automatic interval. Benign.
    produced **no output at all**: no `_write` existed anywhere and the link uses
    `-specs=nosys.specs`, whose stub discards everything. Every `DEBUG_PRINTF` in
    the tree was writing to nowhere. Arguably a real fix in its own right.
+
+---
+
+## /CS-resync escape hatch (committed as `9bae07e`)
+
+The escape hatch (60 consecutive rejected frames) does the datasheet VoSPI
+resync instead of relying on the CCI power cycle alone:
+
+- `lepton_cs_release()` / `lepton_cs_restore()` in `Src/lepton.c`: switch PB12
+  to a GPIO output driven high, then back to AF (SPI2_NSS, /CS low). SPI2
+  stays enabled; only PB12's MODER bits change (GPIOB also holds the sensor
+  power enables and I2C1). Interrupts masked around the read-modify-write.
+- Every firing: /CS high, wait `LEPTON_VOSPI_RESYNC_MS` (250 ms) with no
+  transfer (SCK idle, EXTI disabled), /CS low. Sensor config untouched.
+- In `9bae07e`, every 4th consecutive firing also ran the old CCI power cycle
+  inside the /CS-high window.
+- `LEPTON_CS_RESYNC_ON_START` (a /CS resync on every stream start) is present
+  but off. The resync path's 185 ms wait is unchanged.
+- Counters at +0xD0..+0xDC, phase `PHASE_CS_RESYNC` = 15.
+
+### Result: it does not recover the soak wedge
+
+- **Soak wedge on `9bae07e` (grab 2725, no debugger involved).** Held with one
+  ffmpeg grab, `hard_recoveries` (+0xC8, absolute `0x200000DC` with `g_dbg` at
+  `0x20000014`) read `0x8D` = 141 and climbing. So the escape hatch fired ~141
+  times, each with a /CS resync and ~35 of them with a CCI power cycle as well,
+  and the unit stayed wedged. Still to read on that build: `cs_resyncs`
+  `0x200000E4`, `wedge_recoveries` `0x200000E8`, `last_recovery_firings`
+  `0x200000EC`, `cs_busy_waits` `0x200000F0`.
+- **Unverified: did /CS actually go high at the sensor?** The one manual attempt
+  read `GPIOB_IDR` bit 12 = 0 with ODR12 = 1, and it's unknown whether MODER was
+  in output mode at that moment. If something outside the MCU holds /CS low,
+  the /CS resync never happened and this result says nothing about it. Check:
+  halt, `GPIOB_MODER` = `A92A648A`, ODR bit 12 = 1, read `GPIOB_IDR` bit 12
+  (must be 1), restore `AA2A648A`, Run. Or put a scope on the sensor's
+  SPI_CS_L (Lepton pin 14): while the wedge is held there should be a 250 ms
+  high pulse every ~5 s.
+- **Retracted: the MCU-core-tab halt result.** Grabs of ~5.1 s while the tab was
+  open happen on `4f116ba` too, whose escape hatch is the CCI power cycle only.
+  So they were not evidence that /CS works. That condition recovers within one
+  escape-hatch firing on either build, so it is a milder desync than the soak
+  wedge, and it is **not** a reproducer. Keep the MCU core tab closed during
+  soaks.
+
+### Next build (working tree on `fix/uvc-stream-restart`, uncommitted)
+
+- **Hardware-reset tier replaces the CCI tier.** Every 2nd consecutive firing
+  (`LEPTON_HW_RESET_EVERY`) pulses `RESET_L` / `PWR_DWN_L` exactly as
+  `lepton_init()` does at boot (both low, `PWR_DWN_L` high after 190 ms,
+  `RESET_L` high after another 190 ms), all inside the /CS-high window, waits
+  `LEPTON_HW_BOOT_MS` = 1500 ms (boot uses 1000), then
+  `lepton_reinit_after_reset()` (part-number detection, VSYNC output, default
+  pseudocolor LUT) and `apply_format_config()`. A host-selected palette is
+  lost on a hardware reset. The CCI tier is gone: it never recovered a wedge
+  (95+ firings on `4f116ba`, ~35 on `9bae07e`).
+- **/CS readback.** `lepton_cs_release()` samples `GPIOB->IDR` right after
+  driving PB12 high: `cs_stuck_low` (+0xE0) counts releases that read back low,
+  `cs_idr_last` (+0xE4) keeps the last sample. This settles the question above
+  from firmware.
+- New counters: +0xE0 `cs_stuck_low`, +0xE4 `cs_idr_last`, +0xE8 `hw_resets`.
+  `last_recovery_firings`: odd = /CS alone, even = hardware reset.
+- Builds clean (13.3.1, no new warnings). `g_dbg` still at `0x20000014`, now
+  0xEC bytes; `lepton_buffers` moved to `0x20002124`. Re-check the map.
+
+An MCU reset is still the only known cure, and does three things: hardware-
+resets the sensor, floats the SPI pins, and resets all MCU state. With /CS
+covered (if the readback proves it goes high), this build tests the first.
+If the hardware reset also fails, the stuck state is MCU-side, and a
+`NVIC_SystemReset()` escape hatch becomes the practical failsafe while the
+cause is found.
+
+Worst-case recovery time is two firings plus a boot: ~5 + ~5 + ~2.4 s. Keep
+the repro timeout at `-t 30`.
 
 ---
 
@@ -338,6 +425,12 @@ state for most of `lepton_task`'s loop body.
 
 ## Current leading hypothesis (unverified)
 
+*Status 2026-09-18:* the firmware /CS resync did **not** recover a soak wedge
+(141 escape-hatch firings). Either /CS never actually went high (being
+checked), or the stuck state survives the datasheet resync. The
+hardware-reset tier is the next test. The text below is the hypothesis as it
+stood before that result.
+
 **The sensor is stuck in its unsynchronized state, sending only discard
 packets, and nothing the firmware does after boot can take it out of that
 state.** (Revised 2026-09-18 after the buffer dump. The earlier framing-offset
@@ -412,8 +505,12 @@ Steps 1–2 are non-destructive. Steps 3–4 may clear the wedge, so they go las
 
 | dump says | sham | /CS test | conclusion |
 |---|---|---|---|
-| **DISCARDS ONLY (observed)** | **no (observed)** | recovers | **confirmed**: the sensor is stuck unsynchronized and only the datasheet resync gets it out |
-| DISCARDS ONLY | no | no | sensor stuck deeper (VoSPI or pipeline); try a `RESET_L` pulse next |
+| **DISCARDS ONLY (observed)** | inconclusive | recovers | would have confirmed the /CS resync as the cure |
+| **DISCARDS ONLY (observed)** | inconclusive | **no (observed on `9bae07e`, pending the /CS readback)** | sensor stuck deeper, or /CS never went high; hardware-reset tier next |
+
+The manual steps 3–4 proved hard to run cleanly (halting the core upsets the
+USB stream). The /CS test is now done in firmware; see the escape-hatch
+section above.
 | FRAMING OFFSET or BIT SLIP | no | recovers | **confirmed**: fix = datasheet resync (below) |
 | FRAMING OFFSET or BIT SLIP | recovers | — | sensor times out on SCK idle alone, but only after > 185 ms: lengthen the idle *and* add /CS |
 | ALIGNED/PARTIAL | — | — | framing is fine; the problem is VSYNC-to-read timing (packet level). Look at EXTI/latency, defect 4 |

@@ -50,7 +50,7 @@ struct dbg_counters {
   uint32_t transfers_done;   /* +0x08  complete_lepton_transfer() returned OK */
   uint32_t transfer_fails;   /* +0x0C  ... returned anything else */
   uint32_t desync_events;    /* +0x10  last_end_line mismatched */
-  uint32_t resync_entries;   /* +0x14  entered the 185ms resync sequence */
+  uint32_t resync_entries;   /* +0x14  entered the resync sequence */
   uint32_t resync_packets;   /* +0x18  discard packets consumed in resync */
   uint32_t frames_completed; /* +0x1C  good frames handed to usb_task */
   uint32_t frames_dropped;   /* +0x20  good frames lost, ring was full */
@@ -81,18 +81,30 @@ struct dbg_counters {
   uint32_t first_line_bad;   /* +0xBC  frames whose FIRST packet was not #0 */
   uint32_t resync_giveups;   /* +0xC0  resyncs that hit the packet cap */
   uint32_t vsync_cfg_fails;  /* +0xC4  lepton_restore_vsync_config() errors */
-  uint32_t hard_recoveries;  /* +0xC8  escape hatch fired this many times */
+  uint32_t hard_recoveries;  /* +0xC8  escape hatch fired this many times
+                                        (hardware reset from the hw-reset build) */
   uint32_t worst_desync_run; /* +0xCC  longest run of consecutive rejects seen */
 
   /* --- /CS VoSPI resync, added with the /CS-toggling escape hatch --- */
-  uint32_t cs_resyncs;            /* +0xD0  /CS-high resyncs performed */
+  uint32_t cs_resyncs;            /* +0xD0  /CS-high resyncs performed (every
+                                             resync, from the hw-reset build) */
   uint32_t wedge_recoveries;      /* +0xD4  frame validated after >= 1 escape-hatch
                                              firing, within the same stream */
-  uint32_t last_recovery_firings; /* +0xD8  firings the latest recovery needed:
-                                             1..3 = /CS resync alone did it,
-                                             4 = right after a /CS + CCI power cycle */
+  uint32_t last_recovery_firings; /* +0xD8  escape-hatch firings (hardware
+                                             resets) the latest recovery needed */
   uint32_t cs_busy_waits;         /* +0xDC  lepton_cs_release() found a transfer
                                              in flight (should stay 0) */
+
+  /* --- /CS readback and hardware-reset tier --- */
+  uint32_t cs_stuck_low;          /* +0xE0  PB12 driven high but read back low:
+                                             /CS is held down outside the MCU */
+  uint32_t cs_idr_last;           /* +0xE4  GPIOB->IDR sampled right after the
+                                             latest /CS release (bit 12 = /CS) */
+  uint32_t hw_resets;             /* +0xE8  RESET_L / PWR_DWN_L hardware resets */
+  uint32_t giveup_recoveries;     /* +0xEC  frame validated after a resync walk
+                                             saw only discards, with no hardware
+                                             reset in between: the /CS resync
+                                             alone recovered a wedge-like state */
 };
 
 extern volatile struct dbg_counters g_dbg;

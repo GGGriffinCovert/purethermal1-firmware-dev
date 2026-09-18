@@ -38,19 +38,18 @@ uint8_t lepton_i2c_buffer[36];
 // sits well above that and well below forever. g_dbg.worst_desync_run records
 // how close normal operation actually gets, so it can be tuned from data.
 #define LEPTON_MAX_CONSECUTIVE_DESYNCS (60)
-#define LEPTON_RECOVER_POWER_OFF_MS    (250)
-#define LEPTON_RECOVER_SETTLE_MS       (250)
 
-// Escape-hatch tiers. Every firing does the datasheet VoSPI resync (/CS high,
-// SCK idle > 185 ms), which leaves the sensor's configuration alone. Every
-// LEPTON_CCI_REINIT_EVERY-th consecutive firing also does the old CCI power
-// cycle and reconfiguration, inside the /CS-high window. g_dbg records which
-// tier a recovery needed (last_recovery_firings).
-#define LEPTON_CCI_REINIT_EVERY        (4)
+// Every resync is the full datasheet procedure (Rev 400 section 4.2.3.3.1):
+// /CS high with SCK idle for > 5 frame periods, then /CS low and read packet
+// by packet - discards first - until the first video packet. By the time the
+// escape hatch fires (60 rejects = 20 such resyncs) that has failed, so the
+// escape hatch hardware-resets the sensor (RESET_L / PWR_DWN_L, as at boot)
+// and then runs one more resync. The CCI power cycle it used before never
+// recovered a wedge (95+ firings on 4f116ba, ~35 on 9bae07e).
 
 // Define to also do a /CS resync on every stream start (after the CCI power-on
-// and VSYNC config). Off while the escape hatch alone is being evaluated, so
-// that any recovery can be attributed to it.
+// and VSYNC config). Off: every resync already does the /CS procedure, so this
+// only matters if stream restarts turn out to need it up front.
 // #define LEPTON_CS_RESYNC_ON_START
 
 #define RING_SIZE (4)
@@ -169,6 +168,7 @@ PT_THREAD( lepton_task(struct pt *pt))
 	static int resync_tries = 0;
 	static uint32_t consecutive_desyncs = 0;
 	static uint32_t escape_firings = 0;     // since the last validated frame
+	static uint8_t saw_giveup = 0;          // a resync walk found only discards
 	static uint8_t has_started_a_stream = 0;
 	curtick = last_tick = HAL_GetTick();
 
@@ -245,8 +245,10 @@ PT_THREAD( lepton_task(struct pt *pt))
 			HAL_NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
 #endif
 
-			// A recovery in a new stream can't be credited to the escape hatch.
+			// A recovery in a new stream can't be credited to what happened in
+			// the previous one.
 			escape_firings = 0;
+			saw_giveup = 0;
 		}
 #endif
 
@@ -322,50 +324,39 @@ PT_THREAD( lepton_task(struct pt *pt))
 			{
 				g_dbg.hard_recoveries++;
 				escape_firings++;
-				DEBUG_PRINTF("Unrecoverable desync, VoSPI resync #%lu\r\n", escape_firings);
+				DEBUG_PRINTF("Unrecoverable desync, sensor hardware reset #%lu\r\n", escape_firings);
 
 				HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
 
-				// No transfer is in flight here (the last one completed and was
-				// just rejected) and none starts until /CS is restored, so SCK
-				// stays idle for the whole window.
-				DBG_PHASE(PHASE_CS_RESYNC);
+				// /CS stays high through the reset, the boot wait and the CCI
+				// reconfiguration, and the resync below keeps it high for its
+				// own window before reading, so the sensor boots with /CS
+				// deasserted and SCK idle, as at MCU power-up.
+				DBG_PHASE(PHASE_RECOVER);
 				lepton_cs_release();
-				g_dbg.cs_resyncs++;
-
-				if ((escape_firings % LEPTON_CCI_REINIT_EVERY) == 0)
-				{
-					DBG_PHASE(PHASE_RECOVER);
-					lepton_low_power();
-					transferring_timer = HAL_GetTick();
-					PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_RECOVER_POWER_OFF_MS);
-
-					lepton_power_on();
-					transferring_timer = HAL_GetTick();
-					PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_RECOVER_SETTLE_MS);
-
-					DBG_PHASE(PHASE_VSYNC_CFG);
-					if (lepton_restore_vsync_config() != HAL_OK)
-						g_dbg.vsync_cfg_fails++;
-
-					apply_format_config();
-					DBG_PHASE(PHASE_CS_RESYNC);
-				}
-
-				// The > 185 ms idle counts from here, after any CCI work.
+				g_dbg.hw_resets++;
+				lepton_hw_reset_assert();
 				transferring_timer = HAL_GetTick();
-				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_VOSPI_RESYNC_MS);
-				lepton_cs_restore();
+				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_HW_RESET_STEP_MS);
+
+				lepton_hw_pwdn_release();
+				transferring_timer = HAL_GetTick();
+				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_HW_RESET_STEP_MS);
+
+				lepton_hw_reset_release();
+				transferring_timer = HAL_GetTick();
+				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_HW_BOOT_MS);
+
+				DBG_PHASE(PHASE_VSYNC_CFG);
+				if (lepton_reinit_after_reset() != HAL_OK)
+					g_dbg.vsync_cfg_fails++;
+
+				apply_format_config();
 
 				while (dequeue_lepton_buffer() != NULL) {}
 
-				__HAL_GPIO_EXTI_CLEAR_IT(LEPTON_GPIO3_Pin);
-				HAL_NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
-
-				current_frame_count = 0;
 				consecutive_desyncs = 0;
-				current_buffer = NULL;
-				continue;
+				current_frame_count = 3;   // fall through into the resync below
 			}
 
 			if (current_frame_count > 2)
@@ -377,21 +368,27 @@ PT_THREAD( lepton_task(struct pt *pt))
 				DEBUG_PRINTF("Synchronization lost, status: %d, last end line %d\r\n",
 					current_buffer->status, last_end_line);
 
+				// Datasheet VoSPI (re)sync, step 1: /CS high with SCK idle for
+				// more than 5 frame periods. This used to idle SCK for 185 ms
+				// with /CS still low, which is not the documented procedure and
+				// is also slightly under 5 frame periods (~189 ms at 26.4 Hz).
+				// No transfer is in flight (the last one completed and was just
+				// rejected) and EXTI is off, so SCK stays idle throughout.
+				DBG_PHASE(PHASE_CS_RESYNC);
+				lepton_cs_release();
+				g_dbg.cs_resyncs++;
 				transferring_timer = HAL_GetTick();
-				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > 185);
+				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_VOSPI_RESYNC_MS);
+				lepton_cs_restore();
+				DBG_PHASE(PHASE_RESYNC);
 
-				// Discard packets until the START of a segment.
-				//
-				// This previously stopped at the first non-discard packet, which
-				// is not the same thing. VoSPI only guarantees alignment from
-				// packet 0; stopping at, say, packet 30 meant the bulk read that
-				// follows ran off the end of the segment into the inter-segment
-				// gap, where MISO idles high and the buffer tail fills with 0xFF.
-				// That is exactly the last_end_line == 255 seen on a wedged unit,
-				// with a valid segment number still readable at line 20. The
-				// frame then failed validation, triggered another resync, and the
-				// cycle repeated forever - 1170 rejected frames out of 1170, and
-				// no recovery short of a power cycle.
+				// Steps 2-4: with /CS low, keep clocking - the first packets are
+				// discards - until the first video packet, which is packet 0 of
+				// a segment. VoSPI only guarantees alignment from packet 0, so
+				// the walk must not stop at any other non-discard packet. Reading
+				// must be continuous from here: waiting for VSYNC instead would
+				// leave the rest of that segment unread, which is itself a
+				// loss-of-sync condition.
 				resync_tries = 0;
 				do {
 					g_dbg.resync_packets++;
@@ -409,6 +406,7 @@ PT_THREAD( lepton_task(struct pt *pt))
 					if (++resync_tries > RESYNC_MAX_PACKETS)
 					{
 						g_dbg.resync_giveups++;
+						saw_giveup = 1;
 						break;
 					}
 
@@ -445,6 +443,14 @@ PT_THREAD( lepton_task(struct pt *pt))
 			g_dbg.last_recovery_firings = escape_firings;
 			escape_firings = 0;
 		}
+		else if (saw_giveup)
+		{
+			// A resync walk had seen nothing but discards (the wedge
+			// signature), and a later /CS resync got video back without a
+			// hardware reset.
+			g_dbg.giveup_recoveries++;
+		}
+		saw_giveup = 0;
 
 		if (((curtick = HAL_GetTick()) - last_tick) > 3000)
 		{

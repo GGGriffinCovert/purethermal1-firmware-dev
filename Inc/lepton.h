@@ -121,6 +121,16 @@ void lepton_transfer(lepton_buffer *buf, int nlines);
 void lepton_cs_release(void);
 void lepton_cs_restore(void);
 
+/* Sensor hardware reset, same timing as lepton_init(): assert, wait
+ * LEPTON_HW_RESET_STEP_MS, release PWR_DWN_L, wait LEPTON_HW_RESET_STEP_MS,
+ * release RESET_L, wait LEPTON_HW_BOOT_MS before any CCI command (boot uses
+ * 1000 ms). */
+#define LEPTON_HW_RESET_STEP_MS (190)
+#define LEPTON_HW_BOOT_MS       (1500)
+void lepton_hw_reset_assert(void);
+void lepton_hw_pwdn_release(void);
+void lepton_hw_reset_release(void);
+
 void print_image_binary_background(void);
 void lepton_init(void );
 
