@@ -112,6 +112,14 @@ typedef struct _lepton_buffer {
 lepton_status complete_lepton_transfer(lepton_buffer *);
 void lepton_transfer(lepton_buffer *buf, int nlines);
 
+/* wedge lab helpers (Src/lepton.c) */
+void lepton_cs_release(void);
+void lepton_cs_restore(void);
+void lepton_hw_reset_assert(void);
+void lepton_hw_pwdn_release(void);
+void lepton_hw_reset_release(void);
+void lepton_spi_reinit(void);
+
 void print_image_binary_background(void);
 void lepton_init(void );
 

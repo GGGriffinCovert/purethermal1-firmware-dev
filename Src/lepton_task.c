@@ -14,6 +14,7 @@
 
 #include "tasks.h"
 #include "project_config.h"
+#include "wedge_lab.h"
 
 extern volatile uint8_t g_lepton_type_3;
 extern struct uvc_streaming_control videoCommitControl;
@@ -25,6 +26,8 @@ uint8_t lepton_i2c_buffer[36];
 
 #define RING_SIZE (4)
 lepton_buffer lepton_buffers[RING_SIZE];
+
+volatile struct wedge_lab g_lab = { .magic = LAB_MAGIC, .auto_cmd = LAB_AUTO_CMD };
 
 lepton_buffer* completed_frames_buf[RING_SIZE] = { 0 };
 DECLARE_CIRC_BUF_HANDLE(completed_frames_buf);
@@ -89,10 +92,134 @@ static lepton_buffer *current_buffer = NULL;
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	static int current_buffer_index = 0;
+	g_lab.vsync_irqs++;
 	lepton_buffer *buffer = &lepton_buffers[current_buffer_index];
 	current_buffer = buffer;
 	current_buffer_index = ((current_buffer_index + 1) % RING_SIZE);
 	HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
+}
+
+/* ---- wedge lab ----------------------------------------------------------
+ * lab_action() runs one recovery action (see wedge_lab.h) as a child
+ * protothread of lepton_task, always at a point where no transfer is in
+ * flight and EXTI is disabled, so SCK is idle unless the action clocks it. */
+
+static void lab_apply_format_config(void)
+{
+	/* the same configuration lepton_task applies at stream start */
+	if (g_format_y16)
+	{
+		if (videoCommitControl.bFrameIndex == VS_FRAME_INDEX_TELEMETRIC)
+			enable_telemetry();
+		else
+			disable_telemetry();
+		disable_lepton_agc();
+		enable_raw14();
+	}
+	else
+	{
+		disable_telemetry();
+		enable_lepton_agc();
+		enable_rgb888((LEP_PCOLOR_LUT_E)-1);
+	}
+}
+
+#define LAB_WALK_MAX_PACKETS (2000)
+
+static struct pt lab_pt;
+
+static PT_THREAD( lab_action(struct pt *pt))
+{
+	static uint32_t cmd, hold_ms, t0;
+	static int tries;
+	static uint16_t hdr;
+	lepton_buffer *buf = &lepton_buffers[0];
+
+	PT_BEGIN(pt);
+
+	cmd = g_lab.cmd;
+	hold_ms = g_lab.arg ? g_lab.arg : 250;
+	g_lab.state = 5;
+	g_lab.last_cmd = cmd;
+	g_lab.frames_ok_before = g_lab.frames_ok;
+
+	if (cmd == LAB_CMD_MCU_RESET)
+		NVIC_SystemReset();
+
+	if (cmd == LAB_CMD_CS_ONLY || cmd == LAB_CMD_CS_WALK || cmd == LAB_CMD_HW_RESET)
+		lepton_cs_release();
+
+	if (cmd == LAB_CMD_HW_RESET)
+	{
+		lepton_hw_reset_assert();
+		t0 = HAL_GetTick();
+		PT_WAIT_UNTIL(pt, (HAL_GetTick() - t0) > 190);
+		lepton_hw_pwdn_release();
+		t0 = HAL_GetTick();
+		PT_WAIT_UNTIL(pt, (HAL_GetTick() - t0) > 190);
+		lepton_hw_reset_release();
+		t0 = HAL_GetTick();
+		PT_WAIT_UNTIL(pt, (HAL_GetTick() - t0) > 1500);   /* boot uses 1000 */
+		lepton_reinit_after_reset();
+		lab_apply_format_config();
+	}
+	else if (cmd == LAB_CMD_CCI_CYCLE)
+	{
+		lepton_low_power();
+		t0 = HAL_GetTick();
+		PT_WAIT_UNTIL(pt, (HAL_GetTick() - t0) > 250);
+		lepton_power_on();
+		t0 = HAL_GetTick();
+		PT_WAIT_UNTIL(pt, (HAL_GetTick() - t0) > 250);
+		lepton_restore_vsync_config();
+		lab_apply_format_config();
+	}
+	else if (cmd == LAB_CMD_SPI_REINIT)
+	{
+		lepton_spi_reinit();
+	}
+
+	/* the idle window: /CS high for 1, 2, 5; /CS low for 3 */
+	if (cmd == LAB_CMD_CS_ONLY || cmd == LAB_CMD_CS_WALK ||
+	    cmd == LAB_CMD_IDLE_WALK || cmd == LAB_CMD_HW_RESET)
+	{
+		t0 = HAL_GetTick();
+		PT_WAIT_UNTIL(pt, (HAL_GetTick() - t0) > hold_ms);
+	}
+	lepton_cs_restore();   /* no-op if /CS was never released */
+
+	/* datasheet steps 2-4: keep clocking, discards first, until packet 0, then
+	   read the rest of that segment without waiting for VSYNC */
+	if (cmd == LAB_CMD_CS_WALK || cmd == LAB_CMD_IDLE_WALK ||
+	    cmd == LAB_CMD_HW_RESET || cmd == LAB_CMD_SPI_REINIT)
+	{
+		tries = 0;
+		do {
+			g_lab.walk_packets++;
+			lepton_transfer(buf, 1);
+			t0 = HAL_GetTick();
+			PT_YIELD_UNTIL(pt, buf->status != LEPTON_STATUS_TRANSFERRING || (HAL_GetTick() - t0) > 200);
+			hdr = g_format_y16 ? buf->lines.y16[0].header[0] : buf->lines.rgb[0].header[0];
+			g_lab.walk_last_header = hdr;
+		} while (buf->status == LEPTON_STATUS_OK && (hdr & 0x8fff) != 0 &&
+		         ++tries < LAB_WALK_MAX_PACKETS);
+
+		if (buf->status == LEPTON_STATUS_OK && (hdr & 0x8fff) == 0)
+		{
+			g_lab.lab_walk_found++;
+			lepton_transfer(buf, IMAGE_NUM_LINES + g_telemetry_num_lines - 1);
+			t0 = HAL_GetTick();
+			PT_YIELD_UNTIL(pt, buf->status != LEPTON_STATUS_TRANSFERRING || (HAL_GetTick() - t0) > 200);
+		}
+		else
+		{
+			g_lab.lab_walk_giveups++;
+		}
+	}
+
+	g_lab.cmds_done++;
+	g_lab.cmd = 0;
+	PT_END(pt);
 }
 
 PT_THREAD( lepton_task(struct pt *pt))
@@ -107,6 +234,7 @@ PT_THREAD( lepton_task(struct pt *pt))
 	static uint8_t current_segment = 0;
 	static uint8_t last_end_line = 0;
 	static uint8_t has_started_a_stream = 0;
+	static uint8_t lab_auto_pending = 0;   /* an auto action ran, no frame since */
 	curtick = last_tick = HAL_GetTick();
 
 #ifdef THERMAL_DATA_UART
@@ -133,6 +261,9 @@ PT_THREAD( lepton_task(struct pt *pt))
 			}
 
 			// Start slow blink (1 Hz)
+			g_lab.state = 1;
+			lab_auto_pending = 0;
+			g_lab.bad_run = 0;
 			while (g_uvc_stream_status == 0)
 			{
 				HAL_GPIO_TogglePin(SYSTEM_LED_GPIO_Port, SYSTEM_LED_Pin);
@@ -170,9 +301,27 @@ PT_THREAD( lepton_task(struct pt *pt))
 		}
 #endif
 
+		// wedge lab: run a pending action with EXTI off and nothing in flight
+		if (g_lab.cmd)
+		{
+			HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
+			current_buffer = NULL;
+			while (dequeue_lepton_buffer() != NULL) {}
+			PT_SPAWN(pt, &lab_pt, lab_action(&lab_pt));
+			__HAL_GPIO_EXTI_CLEAR_IT(LEPTON_GPIO3_Pin);
+			HAL_NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
+			current_frame_count = 0;
+			g_lab.bad_run = 0;
+			g_lab.walk_discard_run = 0;
+		}
+
 		HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
-		PT_WAIT_UNTIL(pt, current_buffer != NULL);
+		g_lab.state = 2;
+		PT_WAIT_UNTIL(pt, current_buffer != NULL || g_lab.cmd != 0);
+		if (current_buffer == NULL)
+			continue;   // an action was requested while waiting for VSYNC
+		g_lab.state = 3;
 
 		lepton_transfer(current_buffer, IMAGE_NUM_LINES + g_telemetry_num_lines);
 
@@ -187,6 +336,7 @@ PT_THREAD( lepton_task(struct pt *pt))
 		}
 
 		current_frame_count++;
+		g_lab.reads++;
 
 		if (g_format_y16)
 		{
@@ -203,6 +353,20 @@ PT_THREAD( lepton_task(struct pt *pt))
 
 		if (last_end_line != (IMAGE_NUM_LINES + g_telemetry_num_lines - 1))
 		{
+			g_lab.frames_bad++;
+			if (++g_lab.bad_run > g_lab.worst_bad_run)
+				g_lab.worst_bad_run = g_lab.bad_run;
+			if (g_lab.bad_run == LAB_WEDGE_BAD_RUN)
+			{
+				g_lab.wedges_detected++;
+				if (LAB_AUTO_CMD && g_lab.cmd == 0)
+				{
+					g_lab.auto_fired++;
+					lab_auto_pending = 1;
+					g_lab.cmd = LAB_AUTO_CMD;
+				}
+			}
+
 			// flush out any old data since it's no good
 			while (dequeue_lepton_buffer() != NULL) {}
 
@@ -217,7 +381,11 @@ PT_THREAD( lepton_task(struct pt *pt))
 				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > 185);
 
 				// transfer packets until we've actually re-synchronized
+				g_lab.resyncs++;
+				g_lab.state = 4;
+				g_lab.walk_discard_run = 0;
 				do {
+					g_lab.walk_packets++;
 					lepton_transfer(current_buffer, 1);
 
 					transferring_timer = HAL_GetTick();
@@ -227,13 +395,34 @@ PT_THREAD( lepton_task(struct pt *pt))
 							current_buffer->lines.y16[0].header[0] :
 							current_buffer->lines.rgb[0].header[0]);
 
-				} while (current_buffer->status == LEPTON_STATUS_OK && (last_header & 0x0f00) == 0x0f00);
+					// wedge lab bookkeeping; the loop condition is 1.3.0's plus
+					// "no action pending", so an action can break a stuck walk
+					g_lab.walk_last_header = last_header;
+					if ((last_header & 0x0f00) == 0x0f00)
+					{
+						if (++g_lab.walk_discard_run == LAB_WEDGE_DISCARD_RUN)
+						{
+							g_lab.wedges_detected++;
+							if (LAB_AUTO_CMD && g_lab.cmd == 0)
+							{
+								g_lab.auto_fired++;
+								lab_auto_pending = 1;
+								g_lab.cmd = LAB_AUTO_CMD;
+							}
+						}
+					}
 
-				// we picked up the start of a new packet, so read the rest of it in
-				lepton_transfer(current_buffer, IMAGE_NUM_LINES + g_telemetry_num_lines - 1);
+				} while (current_buffer->status == LEPTON_STATUS_OK && (last_header & 0x0f00) == 0x0f00 &&
+				         g_lab.cmd == 0);
 
-				transferring_timer = HAL_GetTick();
-				PT_YIELD_UNTIL(pt, current_buffer->status != LEPTON_STATUS_TRANSFERRING || ((HAL_GetTick() - transferring_timer) > 200));
+				if (g_lab.cmd == 0)
+				{
+					// we picked up the start of a new packet, so read the rest of it in
+					lepton_transfer(current_buffer, IMAGE_NUM_LINES + g_telemetry_num_lines - 1);
+
+					transferring_timer = HAL_GetTick();
+					PT_YIELD_UNTIL(pt, current_buffer->status != LEPTON_STATUS_TRANSFERRING || ((HAL_GetTick() - transferring_timer) > 200));
+				}
 
 				// Make sure we're not about to service an old irq when the interrupts are re-enabled
 				__HAL_GPIO_EXTI_CLEAR_IT(EXTI15_10_IRQn);
@@ -244,6 +433,16 @@ PT_THREAD( lepton_task(struct pt *pt))
 			current_buffer = NULL;
 
 			continue;
+		}
+
+		// this read validated
+		g_lab.frames_ok++;
+		g_lab.bad_run = 0;
+		g_lab.walk_discard_run = 0;
+		if (lab_auto_pending)
+		{
+			g_lab.auto_recovered++;
+			lab_auto_pending = 0;
 		}
 
 		if (((curtick = HAL_GetTick()) - last_tick) > 3000)

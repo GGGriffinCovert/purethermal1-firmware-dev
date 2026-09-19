@@ -4,6 +4,7 @@
 #include "stm32f4xx_hal_spi.h"
 
 #include "lepton.h"
+#include "wedge_lab.h"
 
 #include "project_config.h"
 
@@ -54,6 +55,82 @@ void lepton_transfer(lepton_buffer *buf, int nlines)
   }
 
   buf->status = LEPTON_STATUS_TRANSFERRING;
+}
+
+/* ---- wedge lab helpers --------------------------------------------------
+ * /CS is PB12 (SPI2_NSS, hardware output: low for as long as SPE = 1). To
+ * raise it, borrow the pin as a GPIO output; to lower it, hand it back to the
+ * SPI. Only PB12's MODER bits change: GPIOB also carries the sensor power
+ * enables (PB5, PB7) and I2C1 (PB8, PB9). */
+#define LAB_PIN_MODE(pin, mode) \
+  (GPIOB->MODER = (GPIOB->MODER & ~(3u << (2u * (pin)))) | ((uint32_t)(mode) << (2u * (pin))))
+
+void lepton_cs_release(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  GPIOB->BSRR = (1u << 12);                  /* ODR12 = 1 first */
+  LAB_PIN_MODE(12, 1u);                      /* then output: /CS high */
+  __set_PRIMASK(primask);
+
+  for (volatile int i = 0; i < 32; i++) {}
+  g_lab.cs_idr_last = GPIOB->IDR;
+  if ((g_lab.cs_idr_last & (1u << 12)) == 0)
+    g_lab.cs_stuck_low++;
+}
+
+void lepton_cs_restore(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  LAB_PIN_MODE(12, 2u);                      /* AF5 SPI2_NSS: /CS low */
+  __set_PRIMASK(primask);
+}
+
+/* Sensor hardware reset, same pins as lepton_init(). The caller waits between
+ * the steps (190 ms, 190 ms, then the boot time). */
+void lepton_hw_reset_assert(void)  { LEPTON_RESET_L_LOW; LEPTON_PW_DWN_LOW; }
+void lepton_hw_pwdn_release(void)  { LEPTON_PW_DWN_HIGH; }
+void lepton_hw_reset_release(void) { LEPTON_RESET_L_HIGH; }
+
+/* MCU-side reset of the SPI path only: SPI2 through RCC, both DMA streams
+ * through the HAL. /CS is held low and SCK held at its idle-high level as
+ * plain GPIO outputs throughout, so the sensor sees no /CS edge and no stray
+ * clock. Must be called with no transfer in flight. */
+void lepton_spi_reinit(void)
+{
+  uint32_t cr1 = hspi2.Instance->CR1;
+  uint32_t cr2 = hspi2.Instance->CR2 & ~(SPI_CR2_TXDMAEN | SPI_CR2_RXDMAEN);
+  uint32_t primask;
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  GPIOB->BSRR = (1u << (12 + 16)) | (1u << 13);   /* ODR12 = 0, ODR13 = 1 */
+  LAB_PIN_MODE(12, 1u);
+  LAB_PIN_MODE(13, 1u);
+  __set_PRIMASK(primask);
+
+  __HAL_RCC_SPI2_FORCE_RESET();
+  __HAL_RCC_SPI2_RELEASE_RESET();
+
+  HAL_DMA_DeInit(hspi2.hdmarx);
+  HAL_DMA_DeInit(hspi2.hdmatx);
+  HAL_DMA_Init(hspi2.hdmarx);
+  HAL_DMA_Init(hspi2.hdmatx);
+  hspi2.hdmarx->XferCpltCallback = lepton_spi_rx_dma_cplt;  /* DeInit clears these */
+  hspi2.hdmatx->XferCpltCallback = NULL;
+  hspi2.hdmatx->XferErrorCallback = NULL;
+  hspi2.State = HAL_SPI_STATE_READY;
+
+  hspi2.Instance->CR2 = cr2;
+  hspi2.Instance->CR1 = cr1 & ~SPI_CR1_SPE;
+  hspi2.Instance->CR1 = cr1 | SPI_CR1_SPE;
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  LAB_PIN_MODE(13, 2u);                      /* SCK back to AF5 (SPI idles it high) */
+  LAB_PIN_MODE(12, 2u);                      /* /CS back to AF5: low, SPE = 1 */
+  __set_PRIMASK(primask);
 }
 
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)

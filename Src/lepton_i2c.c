@@ -384,6 +384,23 @@ HAL_StatusTypeDef enable_raw14()
 //  HAL_ERROR    = 0x01,
 //  HAL_BUSY     = 0x02,
 //  HAL_TIMEOUT  = 0x03
+/* wedge lab: re-apply the VSYNC output settings set_lepton_type() applies at
+ * boot (1.3.0 never re-applies them after a CCI power cycle). */
+void lepton_restore_vsync_config(void)
+{
+  LEP_SetOemGpioVsyncPhaseDelay(&hport_desc, LEP_OEM_VSYNC_DELAY_PLUS_2);
+  LEP_SetOemGpioMode(&hport_desc, LEP_OEM_GPIO_MODE_VSYNC);
+}
+
+/* wedge lab: after a hardware reset the sensor is at power-on defaults. Redo
+ * what init_lepton_command_interface() does at boot: type detection + VSYNC
+ * output, default pseudocolor LUT. The stream format is applied separately. */
+void lepton_reinit_after_reset(void)
+{
+  set_lepton_type();
+  set_startup_defaults();
+}
+
 HAL_StatusTypeDef init_lepton_command_interface(void)
 {
   LEP_RESULT result;

@@ -23,5 +23,9 @@ HAL_StatusTypeDef enable_raw14();
 HAL_StatusTypeDef lepton_low_power();
 HAL_StatusTypeDef lepton_power_on();
 
+/* wedge lab */
+void lepton_restore_vsync_config(void);
+void lepton_reinit_after_reset(void);
+
 #endif
 
