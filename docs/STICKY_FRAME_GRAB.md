@@ -14,7 +14,7 @@ Reproduces on Raspbian, Ubuntu, Windows and Jetson. Long-standing; upstream
 issue #23 is a *different* bug (RPi dwc_otg FIQ timeouts).
 
 **Hardware:** PureThermal, Lepton 3/3.5, 160x120 UYVY. MCU reports STM32F412,
-1 MB flash. Test unit serial `0053001e-…`.
+1 MB flash. Test unit serial `0053001e-…`; the wedge-lab runs use `0023000a-…`.
 
 **Build:** master builds as `-DSTM32F411xE` with `STM32F411CEUx_FLASH.ld`
 (128 K RAM / 512 K flash) even on the F412. Works, but leaves half the part
@@ -104,6 +104,7 @@ offsets from the base are stable; new fields are only ever appended.
 | +0xE0 | `cs_stuck_low` (hw-reset build: PB12 driven high but read low) |
 | +0xE4 | `cs_idr_last` (hw-reset build: GPIOB IDR after last /CS release) |
 | +0xE8 | `hw_resets` (hw-reset build) |
+| +0xEC | `giveup_recoveries` (hw-reset build) |
 
 `main_loop_ticks` distinguishes *blocked* from *waiting* — it advances at
 ~470 k/s while the scheduler runs. `phase` alone cannot, because several phases
@@ -295,55 +296,107 @@ resync instead of relying on the CCI power cycle alone:
 
 - **Soak wedge on `9bae07e` (grab 2725, no debugger involved).** Held with one
   ffmpeg grab, `hard_recoveries` (+0xC8, absolute `0x200000DC` with `g_dbg` at
-  `0x20000014`) read `0x8D` = 141 and climbing. So the escape hatch fired ~141
-  times, each with a /CS resync and ~35 of them with a CCI power cycle as well,
-  and the unit stayed wedged. Still to read on that build: `cs_resyncs`
-  `0x200000E4`, `wedge_recoveries` `0x200000E8`, `last_recovery_firings`
-  `0x200000EC`, `cs_busy_waits` `0x200000F0`.
-- **Unverified: did /CS actually go high at the sensor?** The one manual attempt
-  read `GPIOB_IDR` bit 12 = 0 with ODR12 = 1, and it's unknown whether MODER was
-  in output mode at that moment. If something outside the MCU holds /CS low,
-  the /CS resync never happened and this result says nothing about it. Check:
-  halt, `GPIOB_MODER` = `A92A648A`, ODR bit 12 = 1, read `GPIOB_IDR` bit 12
-  (must be 1), restore `AA2A648A`, Run. Or put a scope on the sensor's
-  SPI_CS_L (Lepton pin 14): while the wedge is held there should be a 250 ms
-  high pulse every ~5 s.
-- **Retracted: the MCU-core-tab halt result.** Grabs of ~5.1 s while the tab was
-  open happen on `4f116ba` too, whose escape hatch is the CCI power cycle only.
-  So they were not evidence that /CS works. That condition recovers within one
-  escape-hatch firing on either build, so it is a milder desync than the soak
-  wedge, and it is **not** a reproducer. Keep the MCU core tab closed during
-  soaks.
+  `0x20000014`) read `0x8D` = 141 and climbing: ~141 /CS windows, ~35 of them
+  with a CCI power cycle too, and the unit stayed wedged.
+- **v1.3.0 with /CS forced high by hand (breakout): did not clear the wedge.**
+  v1.3.0 wedges far faster (~1 in 123 grabs). Caveats: during a wedge v1.3.0
+  keeps clocking SCK (VSYNC reads, resync walks), so "SCK idle" was probably
+  not met while /CS was high; and after /CS came back nothing read
+  continuously.
+- **Why `9bae07e`'s escape hatch may have failed even if /CS went high.** The
+  datasheet procedure has two halves: /CS high with SCK idle > 185 ms, then
+  /CS low and *keep clocking*: discards first, until the first video packet
+  (< 10 ms on Lepton 3). The escape hatch did the first half and then waited
+  for VSYNC and read exactly 60 packets. If the sensor leads with a discard,
+  that read ends one packet short of the segment, and the unread packet is
+  itself a loss-of-sync condition ("failing to read out all packets for a
+  given segment before the next is available"). The existing resync path had
+  the other half (continuous walk to packet 0) but no /CS. Neither path ever
+  did both. Hypothesis, not measured.
+- **Unverified: whether PB12 actually drives the sensor's /CS high.** The
+  next build counts it (`cs_stuck_low`).
 
-### Next build (working tree on `fix/uvc-stream-restart`, uncommitted)
+### The ~5.1 s grabs are a USB artifact, not VoSPI
 
-- **Hardware-reset tier replaces the CCI tier.** Every 2nd consecutive firing
-  (`LEPTON_HW_RESET_EVERY`) pulses `RESET_L` / `PWR_DWN_L` exactly as
-  `lepton_init()` does at boot (both low, `PWR_DWN_L` high after 190 ms,
-  `RESET_L` high after another 190 ms), all inside the /CS-high window, waits
-  `LEPTON_HW_BOOT_MS` = 1500 ms (boot uses 1000), then
-  `lepton_reinit_after_reset()` (part-number detection, VSYNC output, default
-  pseudocolor LUT) and `apply_format_config()`. A host-selected palette is
-  lost on a hardware reset. The CCI tier is gone: it never recovered a wedge
-  (95+ firings on `4f116ba`, ~35 on `9bae07e`).
-- **/CS readback.** `lepton_cs_release()` samples `GPIOB->IDR` right after
-  driving PB12 high: `cs_stuck_low` (+0xE0) counts releases that read back low,
-  `cs_idr_last` (+0xE4) keeps the last sample. This settles the question above
-  from firmware.
-- New counters: +0xE0 `cs_stuck_low`, +0xE4 `cs_idr_last`, +0xE8 `hw_resets`.
-  `last_recovery_firings`: odd = /CS alone, even = hardware reset.
-- Builds clean (13.3.1, no new warnings). `g_dbg` still at `0x20000014`, now
-  0xEC bytes; `lepton_buffers` moved to `0x20002124`. Re-check the map.
+Every time CubeProgrammer halts the core (MCU core tab), grabs take ~5.1 s,
+on `4f116ba` and `9bae07e` alike, with the LED on the 1 Hz *idle* blink, i.e.
+the stream never starts. 5.1 s is most likely the Linux uvcvideo 5 s
+USB control-request timeout plus a normal ~100 ms: a control request goes
+unanswered, v4l2-ctl gives up or retries. Check `dmesg | grep uvcvideo` for
+`-110` (ETIMEDOUT). Once in that state it can persist after Run; a sysfs
+`authorized` toggle re-enumerates without resetting the MCU. The attempt to
+drive /CS by writing `GPIOB_ODR` = `0x10A0` changed nothing electrically: ODR
+is ignored while PB12 is in AF mode (MODER bits `10`). It needs MODER `01`
+too. **Do not halt the core during soaks; disregard every 5.1 s result so
+far.**
 
-An MCU reset is still the only known cure, and does three things: hardware-
-resets the sensor, floats the SPI pins, and resets all MCU state. With /CS
-covered (if the readback proves it goes high), this build tests the first.
-If the hardware reset also fails, the stuck state is MCU-side, and a
-`NVIC_SystemReset()` escape hatch becomes the practical failsafe while the
-cause is found.
+### `9818951`: full-procedure resync + hardware-reset escape hatch
 
-Worst-case recovery time is two firings plus a boot: ~5 + ~5 + ~2.4 s. Keep
-the repro timeout at `-t 30`.
+Committed as `9818951`. Every resync raises /CS for 250 ms with SCK idle, then
+walks continuously to packet 0; the escape hatch is a sensor hardware reset.
+New counters +0xE0..+0xEC (`cs_stuck_low`, `cs_idr_last`, `hw_resets`,
+`giveup_recoveries`).
+
+**Result: grabs fail very quickly, but it is not the wedge.** ffmpeg grabs
+frames normally once the test stops, so the failure is per stream and a
+stream restart (CCI power-on) clears it. Working hypothesis: raising /CS
+mid-stream itself breaks the stream until the next CCI power-on. Possible
+causes: VSYNC stops, or the sensor won't resume VoSPI without a power-on, or
+the walk never finds packet 0 afterwards. Not yet measured. If it's re-run,
+read while a failing grab is held: `phase` (+0x24), `vsync_irqs` (+0x04),
+`resync_entries` (+0x14), `cs_resyncs` (+0xD0), `resync_giveups` (+0xC0),
+`hard_recoveries` (+0xC8), `cs_stuck_low` (+0xE0). The wedge lab's test C
+(below) answers the same question directly.
+
+### `9bae07e` soak (re-run, in progress)
+
+After a few minutes, no wedge yet: `resync_giveups` = 1, `hard_recoveries` = 0,
+`wedge_recoveries` = 0. `0x200000F4` and `0x20000100` are **not** counters on
+this build: `g_dbg` ends at +0xDC there, and those addresses belong to
+`completed_frames_buf_h` (the published-frame ring's bookkeeping, which
+climbs with every frame, and a pointer). `cs_stuck_low` and
+`giveup_recoveries` only exist from `9818951`.
+
+### Wedge lab: branch `scratch/wedge-lab` (from tag `1.3.0`)
+
+v1.3.0 wedges ~40× more often than this branch, so experiments run on it. The
+lab leaves 1.3.0's acquisition path unchanged and adds a counter block
+`g_lab` plus seven recovery actions. They can be fired by hand at a held
+wedge (write the number to `g_lab.cmd` over SWD), or automatically on wedge
+detection (`make LAB_AUTO=n`):
+
+1 /CS only · 2 /CS + continuous walk (full datasheet procedure) · 3 idle +
+walk with /CS low (control) · 4 CCI power cycle · 5 sensor hardware reset ·
+6 SPI2/DMA peripheral reset (MCU side only) · 7 `NVIC_SystemReset()` (the known
+cure).
+
+Full description, counter offsets and the suggested runs are in
+`docs/WEDGE_LAB.md` on that branch. Builds clean (same warnings as 1.3.0, also
+with `LAB_AUTO` and `USART_DEBUG`).
+
+**First run, `LAB_AUTO=2`, unit `0023000a-…`** (a different unit from the
+handoff's `0053001e-…`; dmesg shows `fw:v` because `git describe --tags`
+found no tag on the build machine, but `g_lab.magic` and `auto_cmd` = 2
+confirm the build):
+
+- Repro: first failure at grab 142, 5 consecutive 20 s timeouts, 26 slow grabs
+  (18%). The slow grabs match 1.3.0's known 18–27% recoverable stalls from the
+  EXTI clear bug. The lab's detector (60 rejected reads) fires on those too:
+  27 detections, 7 followed by a good frame in the same stream. **So on 1.3.0
+  the auto statistics can't separate action 2 from stalls that recover
+  anyway.** Adding the EXTI fix to the lab would remove the stalls without
+  changing the wedge rate (1 in 142 vs 1 in 123).
+- Held wedge, two reads ~10 s apart: VSYNC normal (+318), every read rejected
+  (+318 = 5 × 60 + 18 in progress). Action 2 fired 5 times; /CS verifiably
+  went high each time (`cs_stuck_low` = 0, `cs_idr_last` = `0x33B0`, bit 12
+  set); each action walk reached a packet-0 header (`lab_walk_found` +5);
+  **zero good frames**. The full datasheet /CS procedure does not clear this
+  wedge.
+- The 1.3.0 walk in the wedge reads ~212 discards, then exits on an ID of
+  `0x0000` (`walk_discard_run` = 212, `walk_last_header` = 0). That is either
+  a real packet 0 or the zero padding of a discard read at shifted framing
+  (as in the first dump). A `lepton_buffers` dump from this wedge would say
+  which.
 
 ---
 
@@ -389,6 +442,101 @@ the repro timeout at `-t 30`.
 
 ---
 
+## Wedge-lab results — the recovery action that works (2026-09-21)
+
+Run on `scratch/wedge-lab` (v1.3.0 + lab, `LAB_AUTO` off so actions are fired
+by hand). `g_lab` at `0x20000024`, size `0x70`. Three snapshots: a healthy
+unit mid-stream, a wedged unit idle, and that wedged unit after firing
+**cmd 3** — the control: idle with /CS *low*, then walk — plus one more grab
+attempt and a 5 s wait.
+
+| field | +off | normal | wedged | after cmd 3 | Δ |
+|---|---|---|---|---|---|
+| `last_cmd`         | 0x0C | 0 | 0 | **3** | |
+| `cmds_done`        | 0x10 | 0 | 0 | 1 | |
+| `frames_ok_before` | 0x14 | 0 | 0 | 5218 | |
+| `vsync_irqs`       | 0x18 | 156 | 11013 | 11556 | +543 |
+| `reads`            | 0x1C | 155 | 11012 | 11555 | +543 |
+| **`frames_ok`**    | 0x20 | 65 | **5218** | **5218** | **+0** |
+| `frames_bad`       | 0x24 | 90 | 5794 | 6337 | +543 |
+| `bad_run`          | 0x28 | 13 | 0 | **543** | |
+| `worst_bad_run`    | 0x2C | 51 | 1309 | 1309 | +0 |
+| `resyncs`          | 0x30 | 29 | 1932 | 2112 | +180 |
+| `walk_packets`     | 0x34 | 2958 | 244384 | 284794 | +40410 |
+| `walk_discard_run` | 0x38 | 99 | 218 | 219 | |
+| `walk_last_header` | 0x3C | 0 | **0** | **0** | |
+| `lab_walk_found`   | 0x40 | 0 | 0 | 1 | +1 |
+| `lab_walk_giveups` | 0x44 | 0 | 0 | 0 | +0 |
+| `cs_stuck_low`     | 0x48 | 0 | 0 | 0 | |
+| `wedges_detected`  | 0x50 | 0 | 21 | 22 | +1 |
+| `state`            | 0x60 | 3 | 1 (idle) | 3 | |
+
+**Cmd 3 does not recover.** `frames_ok` is frozen at `frames_ok_before` across
+543 further reads, and `bad_run` = 543 — every read since the action was
+rejected. This is the control the /CS actions needed, and it lands where
+expected: a long SCK idle with /CS low changes nothing.
+
+**Cmd 5 — sensor hardware reset — does recover.** Reported from the bench and
+reproduced on the next wedge. It is the first thing in this investigation that
+has cleared a wedge without resetting the MCU. Cmd 5 is `RESET_L` + `PWR_DWN_L`
+low, the boot sequence's 190/190/1500 ms timing, `lepton_reinit_after_reset()`
+plus format config, then the /CS-high window and the walk.
+
+### The wedged bitstream is not "discards only" — it is discards *and silence*
+
+A 256-byte window at the base of `lepton_buffers`, healthy vs wedged:
+
+```
+normal  +0x000  2000 B0B5 6C00 995B 0096 4F00 9346 0091   <- ID 0x2000 (pkt 0), CRC, RGB payload
+        +0x0F4  0001 F5E1 9200 9C97 ...                    <- ID 0x0001 (pkt 1), exactly 244 B later
+
+wedged  +0x000  0000 0000 0000 0000 0000 0000 0000 0000
+        +0x03C  .... .... 03FF FFFF C000 0000 ....         <- a ~26-bit burst
+        +0x05A  .... 3D3D 6E40 1801 F7C6 C000 8000 ....    <- a second short burst
+        (everything else zero through +0x0FF)
+```
+
+The healthy buffer is textbook: packet 0 of segment 2, then packet 1 at
+exactly +244, real image payload. The wedged buffer is *zeros* with two brief
+bursts — MISO is not carrying VoSPI at all at that instant.
+
+That is not a stale buffer. The resync walk calls
+`lepton_transfer(current_buffer, 1)` in a loop, so the first 244 bytes are
+overwritten continuously; this is what the last read actually clocked in.
+
+With the counters, the wedged bitstream resolves as **runs of ~220 discard
+packets alternating with stretches where the sensor drives nothing.**
+`walk_packets`/`resyncs` over the cmd-3 window is 40410/180 ≈ 224 packets per
+resync, matching `walk_discard_run` = 218–219, while `wedges_detected` = 21
+shows the 5000-discard threshold was still being reached earlier in the run.
+A real packet 0 never appears.
+
+### Defect 7: the resync walk exits on an all-zero header
+
+Every walk in the tree treats `0x0000` as a legitimate packet boundary:
+
+- v1.3.0 / lab: `while (... && (last_header & 0x0f00) == 0x0f00)` — continue
+  *only* while the header is a discard. `0x0000` is not a discard, so it exits.
+- `fix/uvc-stream-restart`:
+  `while (... ((hdr & 0x0f00) == 0x0f00) || ((hdr & 0x00ff) != 0x0000))` —
+  `0x0000` passes the "is packet 0" test and exits.
+- lab actions: `while (... (hdr & 0x8fff) != 0)` — same.
+
+So on a wedged unit every resync walks ~220 discards, hits a silent stretch,
+reads `0x0000`, declares sync found, reads 59 more packets of nothing, fails
+validation, waits 185 ms and starts over — 180 times in the cmd-3 window
+alone. `lab_walk_found` reaching 1 is that false positive, not a real packet 0;
+`walk_last_header` = `0x0000` in all three snapshots is the same thing.
+
+This weakens, but does not overturn, the earlier "/CS resync doesn't help"
+result: those builds may have been bailing out of the walk on silence before
+the sensor had a chance to resync. The exit test needs a real packet-0 header —
+MSB clear, `0x0f00` not set, packet number 0, and ideally a correct CRC or a
+following packet numbered 1 — before any conclusion about /CS is safe. Fix it
+regardless: accepting `0x0000` as sync is wrong in every path.
+
+---
+
 ## Theories that are dead
 
 Do not re-litigate these; each died to a measurement.
@@ -423,13 +571,39 @@ state for most of `lepton_task`'s loop body.
 
 ---
 
-## Current leading hypothesis (unverified)
+## Current leading hypothesis
 
-*Status 2026-09-18:* the firmware /CS resync did **not** recover a soak wedge
-(141 escape-hatch firings). Either /CS never actually went high (being
-checked), or the stuck state survives the datasheet resync. The
-hardware-reset tier is the next test. The text below is the hypothesis as it
-stood before that result.
+*Status 2026-09-21 — the wedge lab has answered the question.* Ranked by what
+the lab measured:
+
+| action | what it does | recovers? |
+|---|---|---|
+| 1 | /CS high 250 ms, no walk | no |
+| 2 | /CS high 250 ms + walk (`cs_stuck_low` = 0, `cs_idr_last` = `0x33B0`, so /CS verifiably went high) | no |
+| 3 | idle 250 ms, /CS **low** + walk (control) | no |
+| 4 | CCI power cycle | no |
+| **5** | **sensor hardware reset (`RESET_L`/`PWR_DWN_L`) + reinit + walk** | **yes, twice** |
+| 6 | SPI2/DMA reset (MCU side only) | no |
+
+**The sensor's VoSPI transmitter stops, and only a hardware reset restarts
+it.** The wedged bitstream is discards interleaved with silence, never a video
+packet. The documented resync (/CS high, SCK idle > 185 ms) does not bring it
+back even when the pin is proven high, and neither does a CCI power cycle,
+which is why every earlier escape hatch failed. Pulsing `RESET_L`/`PWR_DWN_L`
+does, which is also why an MCU reset has always appeared to fix it — the reset
+pins are driven low at boot.
+
+Two caveats before this is called closed:
+
+1. Defect 7 above — every walk exits on an all-zero header — means the /CS
+   actions were partly testing a broken search. Re-run action 2 with a strict
+   packet-0 test before concluding /CS can never work.
+2. `9818951` (full datasheet procedure on *every* resync) made grabs fail per
+   stream, so raising /CS mid-stream is itself disruptive. Whatever ships must
+   raise /CS only in the escape hatch, not on the ordinary resync path.
+
+The text below is the hypothesis as it stood before these results; it was
+right about the sensor being stuck and wrong about /CS being the way out.
 
 **The sensor is stuck in its unsynchronized state, sending only discard
 packets, and nothing the firmware does after boot can take it out of that

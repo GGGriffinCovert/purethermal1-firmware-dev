@@ -315,11 +315,15 @@ PT_THREAD( lepton_task(struct pt *pt))
 			// user to physically unplug the camera is a far worse failure than
 			// a half-second interruption.
 			//
-			// A wedged unit's buffers hold nothing but discard packets: the
-			// sensor never re-establishes VoSPI sync, and the CCI power cycle
-			// alone was measured not to help. What it needs (datasheet Rev 400
-			// section 4.2.3.3.1) is /CS high with SCK idle for > 185 ms, which
-			// nothing else in this firmware ever does.
+			// A wedged unit's bitstream is runs of discard packets separated
+			// by stretches where the sensor drives nothing: its VoSPI
+			// transmitter has stopped and never restarts on its own. The wedge
+			// lab fired every candidate at a held wedge - /CS high for 250 ms
+			// with the pin readback proving it went high, a long SCK idle, a
+			// CCI power cycle, an SPI2/DMA reset - and only one brought frames
+			// back: pulsing RESET_L / PWR_DWN_L, the same sequence lepton_init()
+			// runs at boot. That is why an MCU reset has always appeared to fix
+			// this, and it is what the hatch does below.
 			if (consecutive_desyncs >= LEPTON_MAX_CONSECUTIVE_DESYNCS)
 			{
 				g_dbg.hard_recoveries++;
@@ -353,6 +357,14 @@ PT_THREAD( lepton_task(struct pt *pt))
 
 				apply_format_config();
 
+				// Hold /CS high a little longer with SCK still idle, then hand
+				// PB12 back to the SPI. This is the tail of the datasheet's
+				// (re)sync procedure and the sensor has just booted into it.
+				transferring_timer = HAL_GetTick();
+				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_VOSPI_RESYNC_MS);
+				lepton_cs_restore();
+				g_dbg.cs_resyncs++;
+
 				while (dequeue_lepton_buffer() != NULL) {}
 
 				consecutive_desyncs = 0;
@@ -364,23 +376,20 @@ PT_THREAD( lepton_task(struct pt *pt))
 				g_dbg.resync_entries++;
 				DBG_PHASE(PHASE_RESYNC);
 				uint16_t last_header;
+				uint16_t last_crc = 0;
 
 				DEBUG_PRINTF("Synchronization lost, status: %d, last end line %d\r\n",
 					current_buffer->status, last_end_line);
 
-				// Datasheet VoSPI (re)sync, step 1: /CS high with SCK idle for
-				// more than 5 frame periods. This used to idle SCK for 185 ms
-				// with /CS still low, which is not the documented procedure and
-				// is also slightly under 5 frame periods (~189 ms at 26.4 Hz).
-				// No transfer is in flight (the last one completed and was just
-				// rejected) and EXTI is off, so SCK stays idle throughout.
-				DBG_PHASE(PHASE_CS_RESYNC);
-				lepton_cs_release();
-				g_dbg.cs_resyncs++;
+				// Idle SCK for more than 5 frame periods (~189 ms at 26.4 Hz)
+				// with /CS left low. The datasheet's procedure also raises /CS,
+				// but the wedge lab measured that raising it here recovers
+				// nothing and costs a stream: every grab takes at least one
+				// ordinary resync, and a 250 ms /CS-high window in that path
+				// made grabs fail per stream (commit 9818951). /CS now moves
+				// only in the escape hatch above, around the hardware reset.
 				transferring_timer = HAL_GetTick();
-				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > LEPTON_VOSPI_RESYNC_MS);
-				lepton_cs_restore();
-				DBG_PHASE(PHASE_RESYNC);
+				PT_WAIT_UNTIL(pt, (HAL_GetTick() - transferring_timer) > 190);
 
 				// Steps 2-4: with /CS low, keep clocking - the first packets are
 				// discards - until the first video packet, which is packet 0 of
@@ -389,6 +398,11 @@ PT_THREAD( lepton_task(struct pt *pt))
 				// must be continuous from here: waiting for VSYNC instead would
 				// leave the rest of that segment unread, which is itself a
 				// loss-of-sync condition.
+				// A wedged sensor alternates runs of discard packets with
+				// stretches where it drives nothing at all, so the walk reads
+				// 0x0000 - which passes "is packet 0", so the walk used to stop
+				// on silence, read 59 more packets of nothing and fail. A real
+				// packet carries a CRC, so require that word to be non-zero too.
 				resync_tries = 0;
 				do {
 					g_dbg.resync_packets++;
@@ -400,6 +414,9 @@ PT_THREAD( lepton_task(struct pt *pt))
 					last_header = (g_format_y16 ?
 							current_buffer->lines.y16[0].header[0] :
 							current_buffer->lines.rgb[0].header[0]);
+					last_crc    = (g_format_y16 ?
+							current_buffer->lines.y16[0].header[1] :
+							current_buffer->lines.rgb[0].header[1]);
 
 					// Bounded: requiring packet 0 means we could otherwise spin
 					// here indefinitely if the sensor never presents one.
@@ -412,7 +429,8 @@ PT_THREAD( lepton_task(struct pt *pt))
 
 				} while (current_buffer->status == LEPTON_STATUS_OK &&
 				         (((last_header & 0x0f00) == 0x0f00) ||   /* discard packet */
-				          ((last_header & 0x00ff) != 0x0000)));   /* not packet 0 */
+				          ((last_header & 0x00ff) != 0x0000) ||   /* not packet 0 */
+				          (last_crc == 0x0000)));                 /* nothing on the wire */
 
 				// we picked up the start of a new packet, so read the rest of it in
 				lepton_transfer(current_buffer, IMAGE_NUM_LINES + g_telemetry_num_lines - 1);
@@ -445,9 +463,9 @@ PT_THREAD( lepton_task(struct pt *pt))
 		}
 		else if (saw_giveup)
 		{
-			// A resync walk had seen nothing but discards (the wedge
-			// signature), and a later /CS resync got video back without a
-			// hardware reset.
+			// A resync walk had hit the packet cap without finding packet 0,
+			// and a later ordinary resync got video back with no hardware
+			// reset: a deep desync that was not a true wedge.
 			g_dbg.giveup_recoveries++;
 		}
 		saw_giveup = 0;
